@@ -28,7 +28,11 @@ typedef int64_t  s64;
 #  define PS2_NO_MUSTTAIL 1
 #endif
 
-#if defined(__GNUC__)
+#if defined(__clang__)
+/* Clang has no noipa; what matters is that a recompiled function is never
+ * inlined into its callers, or a hook on its entry would miss those calls */
+#  define PS2_NOIPA __attribute__((noinline))
+#elif defined(__GNUC__)
 #  define PS2_NOIPA __attribute__((noipa))
 #else
 #  define PS2_NOIPA
@@ -357,6 +361,17 @@ void ps2_syscall(ps2_ctx *ctx);
 void ps2_trap(ps2_ctx *ctx, u32 insn);
 void ps2_unimplemented(ps2_ctx *ctx, u32 pc, u32 insn);
 void ps2_dispatch(ps2_ctx *ctx, u32 addr);
+#if defined(__clang__)
+/* Clang only guarantees a tail call between functions of one signature, and
+ * a recompiled function is f(ctx) while this is f(ctx, addr). So under Clang
+ * the recompiled code passes the address in a thread-local and tail-calls a
+ * trampoline that has its own signature. GCC takes the two-argument call. */
+extern _Thread_local u32 ps2_dispatch_target;
+void ps2_dispatch_via(ps2_ctx *ctx);
+#  ifdef PS2_GENERATED_CODE
+#    define ps2_dispatch(c, a) ps2_dispatch_via((ps2_dispatch_target = (a), (c)))
+#  endif
+#endif
 ps2_fn ps2_dispatch_lookup(u32 addr);
 int    ps2_dispatch_redirect(u32 addr, ps2_fn fn);
 void ps2_unknown_target(ps2_ctx *ctx, u32 addr);
