@@ -78,6 +78,8 @@ enum { PS2_VK_NATIVE_NONE = 0, PS2_VK_NATIVE_SUN_FLARE = 1,
 
 void ps2_vk_draw_2d(int topology, const ps2_vk_state *st,
                     const ps2_vk_vertex *v, int n);
+void ps2_vk_ip_span_begin(u32 site, u32 flags);
+void ps2_vk_ip_span_end(void);
 typedef struct ps2_vk_native {
     u32 pass;
     u32 rt;

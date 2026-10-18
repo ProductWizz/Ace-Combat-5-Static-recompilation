@@ -224,6 +224,8 @@ static void sanitize(ps2_settings *s) {
     s->hud_layout = clampi(s->hud_layout, 0, 1);
     s->present_mode = clampi(s->present_mode, 0, 3);
     s->fps_limit = clampi(s->fps_limit, 0, 1000);
+    if (s->interp_fps != -1)
+        s->interp_fps = s->interp_fps < 61 ? 0 : clampi(s->interp_fps, 61, 1000);
     s->show_fps = s->show_fps != 0;
     s->ui_scale = clampf(s->ui_scale, 0.5f, 3.0f);
     s->block_input_in_menu = s->block_input_in_menu != 0;
@@ -276,6 +278,7 @@ static const cfg_field fields[] = {
     FI("display", "hud_layout", hud_layout, "with widescreen: 0 stretch the HUD with the picture, 1 keep it 4:3 in the centre"),
     FI("display", "present_mode", present_mode, "0 mailbox, 1 vsync (fifo), 2 immediate, 3 adaptive vsync"),
     FI("display", "fps_limit", fps_limit, "0 off"),
+    FI("display", "interp_fps", interp_fps, "0 off, -1 match the display; else the frame rate to interpolate the scene up to (61..1000)"),
     FI("display", "show_fps", show_fps, "1 on"),
     FF("display", "menu_scale", ui_scale, "0.5..3"),
     FI("input", "block_game_input_in_menu", block_input_in_menu, "1 on"),

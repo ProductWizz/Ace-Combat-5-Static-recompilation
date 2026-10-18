@@ -434,6 +434,43 @@ void present_controls() {
          "only the final presentation, so it cannot make a slow machine run the game faster; "
          "leave it off unless you want an even, lower frame rate.");
     env_note("PS2_FPS_CAP", "overrides the frame-rate limit");
+
+    int display_hz = 0;
+    if (g_window) {
+        const SDL_DisplayMode *dm =
+            SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(g_window));
+        if (dm && dm->refresh_rate > 0.0f) display_hz = (int)(dm->refresh_rate + 0.5f);
+    }
+    bool ip = ps2_cfg.interp_fps != 0;
+    if (ImGui::Checkbox("High frame rate (transform interpolation)", &ip)) {
+        ps2_cfg.interp_fps = ip ? -1 : 0;
+        changed(0);
+    }
+    if (ps2_cfg.interp_fps == -1) {
+        ImGui::SameLine();
+        if (display_hz > 61) ImGui::Text("matching the display, %d Hz", display_hz);
+        else ImGui::TextDisabled("matching the display: %d Hz, nothing to add", display_hz);
+        ImGui::SameLine();
+        if (ImGui::Button("Set a fixed rate")) {
+            ps2_cfg.interp_fps = display_hz > 61 ? display_hz : 120;
+            changed(0);
+        }
+    } else if (ip) {
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 12.0f);
+        if (ImGui::SliderInt("##interpfps", &ps2_cfg.interp_fps, 61, 1000, "%d FPS",
+                             ImGuiSliderFlags_AlwaysClamp))
+            changed(0);
+        ImGui::SameLine();
+        if (ImGui::Button("Match display")) { ps2_cfg.interp_fps = -1; changed(0); }
+    }
+    help("Draws the 3D scene more often than the game ticks. The game still runs at the "
+         "PS2's 59.94 fields a second; in between, the aircraft, terrain and sky are drawn at "
+         "positions blended from the last tick to the current one, and so are the HUD's "
+         "moving parts. It adds a little over one tick (about 19 ms) of latency. Menus and "
+         "movies still update 60 times a second. VSync presentation gives the most even "
+         "pacing when the rate matches the display.");
+    env_note("PS2_INTERP_FPS", "overrides the interpolated frame rate");
 }
 
 struct PresetInfo { const char *name, *blurb; };
@@ -945,6 +982,18 @@ int ps2_ui_event(const SDL_Event *e) {
     if (e->type == SDL_EVENT_KEY_DOWN && e->key.key == SDLK_F4 && !e->key.repeat) {
         ps2_ui_set_visible(!g_visible);
         return 1;
+    }
+    /* no keyboard (a handheld): Select and Start together do what F4 does */
+    if (e->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN && g_cap == CAP_NONE
+        && (e->gbutton.button == SDL_GAMEPAD_BUTTON_START
+            || e->gbutton.button == SDL_GAMEPAD_BUTTON_BACK)) {
+        SDL_Gamepad *g = SDL_GetGamepadFromID(e->gbutton.which);
+        SDL_GamepadButton other = e->gbutton.button == SDL_GAMEPAD_BUTTON_START
+                                ? SDL_GAMEPAD_BUTTON_BACK : SDL_GAMEPAD_BUTTON_START;
+        if (g && SDL_GetGamepadButton(g, other)) {
+            ps2_ui_set_visible(!g_visible);
+            return 1;
+        }
     }
     if (g_cap != CAP_NONE && capture_event(e)) return 1;
     if (!g_visible) {

@@ -131,6 +131,7 @@ static void element_end(void) {
     st2d.elements++;
     st2d.whole += native;
     reanchor();
+    ps2_vk_ip_span_begin(el.site, el.flags);
     for (u32 i = 0; i < el.n; i++) {
         const held_prim *h = &el.held[i];
         st2d.rejected[h->reject]++;
@@ -140,6 +141,7 @@ static void element_end(void) {
         }
         hand_over(h, h->reject == REJ_NONE);
     }
+    ps2_vk_ip_span_end();
     el.n = 0;
 }
 

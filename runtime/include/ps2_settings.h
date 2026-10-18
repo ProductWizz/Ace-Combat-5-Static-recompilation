@@ -58,6 +58,7 @@ typedef struct ps2_settings {
     int   hud_layout;
     int   present_mode;
     int   fps_limit;
+    int   interp_fps;
     int   show_fps;
     float ui_scale;
     int   block_input_in_menu;

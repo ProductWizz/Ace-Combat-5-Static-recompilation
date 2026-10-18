@@ -202,11 +202,24 @@ static int            pub_slot = LIST_SLOTS - 1;
 #define MESH_MAX_INDICES (1u << 19)
 #define MESH_MAX_BLOCKS (1u << 14)
 #define MESH_REC_BYTES 64u
+#define IP_MAX_SPANS 8192u
+typedef struct ip_span { u32 site, flags, vfirst, vcount; } ip_span;
 typedef struct {
     u8 *recs;
     u32 *idx;
     ps2_vk_mesh_block *blocks;
     u32 nrecs, nidx, nblocks;
+    /* frame interpolation: vhash[vbase] is the content hash of the mesh stored
+     * at vbase, keys[block] identifies a block across game ticks */
+    u64 *vhash;
+    u64 *keys;
+    /* vbox[8 * vbase]: local min xyz, max xyz, largest |corner offset| and
+     * largest sprite size of the mesh stored at vbase -- enough to bound it on
+     * screen once its block's transform is known */
+    float *vbox;
+    /* 2D elements of this tick: a run of rec_verts and where it came from */
+    struct ip_span *spans;
+    u32 nspans;
 } mesh_arena;
 static mesh_arena slot_mesh[LIST_SLOTS];
 static mesh_arena *rec_mesh, *pub_mesh, *rep_mesh;
@@ -218,6 +231,9 @@ static u32            pub_nverts, pub_ndraws;
 static u32 rep_nverts, rep_ndraws;
 
 #define FRAMES_IN_FLIGHT 3
+#define GP_MAX 1024u
+enum { GP_MESH, GP_GS, GP_2D, GP_NATIVE, GP_SNAPSHOT, GP_COLCLIP, GP_TARGET, GP_OVERLAY,
+       GP_PRESENT, GP_END, GP_CATS };
 #define RT_MAX 2048u
 #define OV_MAX_DRAWS 16384u
 #define OV_MAX_VERTS (1u << 18)
@@ -228,6 +244,10 @@ typedef struct {
     VkFence fence;
     VkQueryPool timing_queries;
     int timing_pending;
+    /* PS2_SPEED_LOG: where the GPU time of a frame goes, by kind of work */
+    VkQueryPool phase_queries;
+    u32 phase_n;
+    u8  phase_cat[GP_MAX];
     VkBuffer vbuf;
     VkDeviceMemory vmem;
     void *vptr;
@@ -242,6 +262,7 @@ typedef struct {
     VkDeviceMemory mvmem, mimem, mcmem;
     void *mvptr, *miptr, *mcptr;
     VkDescriptorSet mset;
+    u64 list_stamp;
 } vk_frame;
 
 static SDL_Window *window;
@@ -257,8 +278,9 @@ static VkSurfaceKHR surface;
 static VkSwapchainKHR swapchain;
 static VkFormat swap_format;
 static VkExtent2D swap_extent;
-static VkImage swap_images[8];
-static VkImageView swap_views[8];
+#define SWAP_MAX 16u
+static VkImage swap_images[SWAP_MAX];
+static VkImageView swap_views[SWAP_MAX];
 static u32 swap_count;
 static VkCommandPool cmdpool;
 static vk_frame frames[FRAMES_IN_FLIGHT];
@@ -279,6 +301,10 @@ typedef struct {
     int snap_valid;
     int snap_ever;
     s32 sdx0, sdy0, sdx1, sdy1;
+    /* where the target's ALPHA has changed since the snapshot last saw it. A
+     * destination alpha test reads nothing else, and most draws between two
+     * such tests leave alpha alone. */
+    s32 adx0, ady0, adx1, ady1;
     int created;
     int drawn;
     int dclear;
@@ -1098,6 +1124,14 @@ static VkPresentModeKHR pick_present_mode(void) {
     return VK_PRESENT_MODE_FIFO_KHR;
 }
 
+/* PS2_NO_PRESENT=1: draw every field but never touch a swapchain -- for timing
+ * the renderer on a GPU that cannot present to this desktop */
+static int vk_no_present(void) {
+    static int v = -1;
+    if (v < 0) v = env_flag("PS2_NO_PRESENT") > 0;
+    return v;
+}
+
 static int create_swapchain(void) {
     VkSurfaceCapabilitiesKHR caps;
     VkSwapchainCreateInfoKHR ci;
@@ -1105,6 +1139,14 @@ static int create_swapchain(void) {
     u32 nf = 64;
     int w = 0, h = 0;
 
+    if (vk_no_present()) {           /* nothing is ever shown: no swapchain at all */
+        SDL_GetWindowSizeInPixels(window, &w, &h);
+        swap_format = VK_FORMAT_B8G8R8A8_UNORM;
+        swap_extent.width = w > 0 ? (u32)w : 1280u;
+        swap_extent.height = h > 0 ? (u32)h : 896u;
+        swap_count = 0;
+        return 0;
+    }
     VKCHK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(phys, surface, &caps));
     SDL_GetWindowSizeInPixels(window, &w, &h);
     swap_extent = caps.currentExtent;
@@ -1114,10 +1156,37 @@ static int create_swapchain(void) {
     }
     if (swap_extent.width == 0 || swap_extent.height == 0) return 1;
 
-    VKCHK(vkGetPhysicalDeviceSurfaceFormatsKHR(phys, surface, &nf, fmts));
-    swap_format = fmts[0].format;
-    for (u32 i = 0; i < nf; i++)
-        if (fmts[i].format == VK_FORMAT_B8G8R8A8_UNORM) { swap_format = fmts[i].format; break; }
+    /* Mesa's Wayland WSI lists every format and colour space the compositor
+     * offers, which can run past any fixed array; VK_INCOMPLETE is then not a
+     * failure, and the whole list is wanted so BGRA8 is found wherever it is */
+    {   VkSurfaceFormatKHR *all = NULL;
+        u32 total = 0;
+        VkResult fr = vkGetPhysicalDeviceSurfaceFormatsKHR(phys, surface, &total, NULL);
+        if (fr == VK_SUCCESS && total > nf)
+            all = (VkSurfaceFormatKHR *)malloc((size_t)total * sizeof *all);
+        if (all) {
+            nf = total;
+            fr = vkGetPhysicalDeviceSurfaceFormatsKHR(phys, surface, &nf, all);
+        } else {
+            fr = vkGetPhysicalDeviceSurfaceFormatsKHR(phys, surface, &nf, fmts);
+        }
+        if ((fr != VK_SUCCESS && fr != VK_INCOMPLETE) || !nf) {
+            ps2_log("vk: no surface formats (%d, %u listed)", (int)fr, nf);
+            free(all);
+            return -1;
+        }
+        {   const VkSurfaceFormatKHR *list = all ? all : fmts;
+            swap_format = list[0].format;
+            for (u32 i = 0; i < nf; i++)
+                if (list[i].format == VK_FORMAT_B8G8R8A8_UNORM
+                    && list[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+                    swap_format = list[i].format;
+                    break;
+                }
+        }
+        if (total > 64u) ps2_log("vk: the surface lists %u formats", total);
+        free(all);
+    }
 
     memset(&ci, 0, sizeof(ci));
     ci.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
@@ -1130,11 +1199,20 @@ static int create_swapchain(void) {
     ci.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     ci.imageExtent = swap_extent;
     ci.imageArrayLayers = 1;
+    /* transfer-source is only for screenshots of the window; not every surface
+     * allows it, and that is no reason to lose the renderer */
     ci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
-                  | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+                  | (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
     ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ci.preTransform = caps.currentTransform;
     ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    if (!(caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR)) {
+        static const VkCompositeAlphaFlagBitsKHR order[3] = {
+            VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR, VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR,
+            VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR };
+        for (int k = 0; k < 3; k++)
+            if (caps.supportedCompositeAlpha & order[k]) { ci.compositeAlpha = order[k]; break; }
+    }
     ci.presentMode = pick_present_mode();
     ci.clipped = VK_TRUE;
     ci.oldSwapchain = swapchain;
@@ -1144,8 +1222,17 @@ static int create_swapchain(void) {
             vkDestroyImageView(dev, swap_views[i], NULL);
         vkDestroySwapchainKHR(dev, ci.oldSwapchain, NULL);
     }
-    swap_count = 8;
-    VKCHK(vkGetSwapchainImagesKHR(dev, swapchain, &swap_count, swap_images));
+    {   /* a compositor may hand out more images than were asked for */
+        u32 total = 0;
+        VKCHK(vkGetSwapchainImagesKHR(dev, swapchain, &total, NULL));
+        if (total > SWAP_MAX) {
+            ps2_log("vk: the swapchain has %u images, more than the %u this renderer tracks",
+                    total, SWAP_MAX);
+            return -1;
+        }
+        swap_count = total;
+        VKCHK(vkGetSwapchainImagesKHR(dev, swapchain, &swap_count, swap_images));
+    }
     ps2_ui_swapchain_changed(swap_count);
     for (u32 i = 0; i < swap_count; i++) {
         VkImageViewCreateInfo vi;
@@ -1307,6 +1394,8 @@ static int create_target(vk_target *t) {
     t->snap_ever = 0;
     t->sdx0 = (s32)rt_w; t->sdy0 = (s32)rt_h;
     t->sdx1 = 0; t->sdy1 = 0;
+    t->adx0 = 0; t->ady0 = 0;
+    t->adx1 = (s32)rt_w; t->ady1 = (s32)rt_h;
     t->slayout = VK_IMAGE_LAYOUT_UNDEFINED;
     t->created = 1;
     t->drawn = 0;
@@ -1772,7 +1861,15 @@ static int vk_init(void) {
         fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
         fi.flags = VK_FENCE_CREATE_SIGNALED_BIT;
         VKCHK(vkCreateFence(dev, &fi, NULL, &frames[i].fence));
-        if (renderer_speed_enabled() && gpu_timestamp_bits) {
+        if (gpu_timestamp_bits && renderer_speed_enabled()) {
+            VkQueryPoolCreateInfo qi = {0};
+            qi.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+            qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            qi.queryCount = GP_MAX;
+            if (vkCreateQueryPool(dev, &qi, NULL, &frames[i].phase_queries) != VK_SUCCESS)
+                frames[i].phase_queries = VK_NULL_HANDLE;
+        }
+        if (gpu_timestamp_bits) {
             VkQueryPoolCreateInfo qi = {0};
             qi.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
             qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
@@ -2386,8 +2483,20 @@ static void begin_rendering(VkCommandBuffer cmd, vk_target *t, vk_target *zt,
     rendering_open = 1;
 }
 
-static VkDescriptorSet target_snapshot(VkCommandBuffer cmd, vk_target *t) {
+static void gp_mark(VkCommandBuffer cmd, int cat);
+static u64 gp_snapshots;
+/* who asked for the snapshot, and how much of the target each copy moved */
+static int gp_snap_why;               /* 0 self-read, 1 DATE */
+static int gp_snap_mesh;
+static u64 gp_snap_by[2][2], gp_snap_skipped;
+static double gp_snap_area;
+/* only: a rectangle (x0, y0, x1, y1 in target pixels) outside which the
+ * reader never looks -- a destination alpha test reads exactly the pixels it
+ * writes. The snapshot is then refreshed just there, and stays marked stale,
+ * since the rest of it was not brought up to date. */
+static VkDescriptorSet target_snapshot(VkCommandBuffer cmd, vk_target *t, const s32 *only) {
     VkImageCopy rgn;
+    int use_only = 0;
     if (!t->created) return 0;
     if (!t->snap) {
         if (make_image(rt_w * rt_scale, rt_h * rt_scale, VK_FORMAT_R8G8B8A8_UNORM,
@@ -2402,6 +2511,8 @@ static VkDescriptorSet target_snapshot(VkCommandBuffer cmd, vk_target *t) {
         else t->sset = alloc_set(t->sview);
         t->slayout = VK_IMAGE_LAYOUT_UNDEFINED;
         t->snap_valid = 0;
+        t->adx0 = 0; t->ady0 = 0;
+        t->adx1 = (s32)rt_w; t->ady1 = (s32)rt_h;
     }
     if (!t->sset) return 0;
     if (t->snap_valid && t->slayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
@@ -2410,7 +2521,14 @@ static VkDescriptorSet target_snapshot(VkCommandBuffer cmd, vk_target *t) {
     s32 cx0 = 0, cy0 = 0, cx1 = (s32)rt_w, cy1 = (s32)rt_h;
     int partial = t->snap_ever
                && t->slayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    if (partial) {
+    use_only = only && partial;
+    if (use_only) {
+        cx0 = t->adx0 < 0 ? 0 : t->adx0;
+        cy0 = t->ady0 < 0 ? 0 : t->ady0;
+        cx1 = t->adx1 > (s32)rt_w ? (s32)rt_w : t->adx1;
+        cy1 = t->ady1 > (s32)rt_h ? (s32)rt_h : t->ady1;
+        if (cx0 >= cx1 || cy0 >= cy1) { gp_snap_skipped++; return t->sset; }
+    } else if (partial) {
         cx0 = t->sdx0 < 0 ? 0 : t->sdx0;
         cy0 = t->sdy0 < 0 ? 0 : t->sdy0;
         cx1 = t->sdx1 > (s32)rt_w ? (s32)rt_w : t->sdx1;
@@ -2422,7 +2540,18 @@ static VkDescriptorSet target_snapshot(VkCommandBuffer cmd, vk_target *t) {
             return t->sset;
         }
     }
+    if (use_only) {
+        if (only[0] > cx0) cx0 = only[0];
+        if (only[1] > cy0) cy0 = only[1];
+        if (only[2] < cx1) cx1 = only[2];
+        if (only[3] < cy1) cy1 = only[3];
+        if (cx0 >= cx1 || cy0 >= cy1) { gp_snap_skipped++; return t->sset; }
+    }
 
+    gp_mark(cmd, GP_SNAPSHOT);
+    gp_snapshots++;
+    gp_snap_by[gp_snap_why & 1][gp_snap_mesh & 1]++;
+    gp_snap_area += (double)(cx1 - cx0) * (double)(cy1 - cy0) / ((double)rt_w * (double)rt_h);
     if (rendering_open) { vkCmdEndRendering(cmd); rendering_open = 0; }
     barrier(cmd, t->color, VK_IMAGE_ASPECT_COLOR_BIT,
             t->layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -2460,16 +2589,26 @@ static VkDescriptorSet target_snapshot(VkCommandBuffer cmd, vk_target *t) {
             VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
     t->layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     t->slayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    t->snap_valid = 1;
     t->snap_ever = 1;
-    t->sdx0 = (s32)rt_w; t->sdy0 = (s32)rt_h;
-    t->sdx1 = 0; t->sdy1 = 0;
+    if (!use_only) {
+        t->snap_valid = 1;
+        t->sdx0 = (s32)rt_w; t->sdy0 = (s32)rt_h;
+        t->sdx1 = 0; t->sdy1 = 0;
+    }
+    /* alpha is current again wherever this copy reached; one rectangle cannot
+     * hold "stale, minus a hole", so it only empties when all of it was covered */
+    if (!use_only || (only[0] <= t->adx0 && only[1] <= t->ady0
+                      && only[2] >= t->adx1 && only[3] >= t->ady1)) {
+        t->adx0 = (s32)rt_w; t->ady0 = (s32)rt_h;
+        t->adx1 = 0; t->ady1 = 0;
+    }
     t->drawn = 1;
     begin_rendering(cmd, t, cur_zt ? cur_zt : t, 0, 0);
     return t->sset;
 }
 
 static void select_target(VkCommandBuffer cmd, vk_target *t, vk_target *zt) {
+    gp_mark(cmd, GP_TARGET);
     u32 i;
     VkImageMemoryBarrier2 batch[RT_SLOTS * 2u + 2u];
     u32 nb = 0;
@@ -2523,12 +2662,17 @@ static void select_target(VkCommandBuffer cmd, vk_target *t, vk_target *zt) {
     }
     barrier_flush(cmd, batch, nb);
     if (zt != t && zundef) zt->dclear = 1;
+    if (!t->drawn) {                 /* about to be cleared: alpha changes everywhere */
+        t->adx0 = 0; t->ady0 = 0;
+        t->adx1 = (s32)rt_w; t->ady1 = (s32)rt_h;
+    }
     begin_rendering(cmd, t, zt, !t->drawn, 0);
     t->drawn = 1;
     cur_zt = zt;
 }
 
 static int colclip_begin(VkCommandBuffer cmd, vk_target *t, vk_target *zt) {
+    gp_mark(cmd, GP_COLCLIP);
     u32 iw = rt_w * rt_scale, ih = rt_h * rt_scale;
     VkImageBlit b;
     if (!t->fimg) {
@@ -2583,6 +2727,9 @@ static int colclip_begin(VkCommandBuffer cmd, vk_target *t, vk_target *zt) {
 }
 
 static void colclip_resolve(VkCommandBuffer cmd, vk_target *t, vk_target *zt) {
+    gp_mark(cmd, GP_COLCLIP);
+    t->adx0 = 0; t->ady0 = 0;
+    t->adx1 = (s32)rt_w; t->ady1 = (s32)rt_h;
     VkViewport vp;
     VkRect2D sc;
     if (rendering_open) { vkCmdEndRendering(cmd); rendering_open = 0; }
@@ -2623,6 +2770,7 @@ typedef struct {
 } rn_sun_push;
 
 static void native_pass(VkCommandBuffer cmd, vk_frame *fr, const vk_draw *d) {
+    gp_mark(cmd, GP_NATIVE);
     vk_target *t, *zs;
     int use_vis = 0;
     VkViewport vp;
@@ -2640,7 +2788,7 @@ static void native_pass(VkCommandBuffer cmd, vk_frame *fr, const vk_draw *d) {
         VkRenderingAttachmentInfo col;
         VkRenderingInfo ri;
         if (zs == t && t->layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
-            aset = target_snapshot(cmd, t);
+            aset = target_snapshot(cmd, t, NULL);
         else if (zs->layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
             aset = zs->set;
         if (rendering_open) { vkCmdEndRendering(cmd); rendering_open = 0; }
@@ -2762,6 +2910,8 @@ static void native_pass(VkCommandBuffer cmd, vk_frame *fr, const vk_draw *d) {
             sc.extent.height = (u32)(y1 - y0) * rt_scale;
             vkCmdSetScissor(cmd, 0, 1, &sc);
             t->snap_valid = 0;
+            t->adx0 = 0; t->ady0 = 0;
+            t->adx1 = (s32)rt_w; t->ady1 = (s32)rt_h;
             if (x0 < t->sdx0) t->sdx0 = x0;
             if (y0 < t->sdy0) t->sdy0 = y0;
             if (x1 > t->sdx1) t->sdx1 = x1;
@@ -3392,6 +3542,614 @@ static void ov_compose(VkCommandBuffer cmd, vk_frame *fr) {
     stat_ov_frames++;
 }
 
+/* ---- transform interpolation (high frame rate) -----------------------------
+ * The game ticks at 59.94 Hz and that cannot change, but every native mesh
+ * draw carries its whole local-to-screen transform in a ps2_vk_mesh_block.
+ * So the renderer keeps the previous tick's blocks, pairs them with the
+ * current tick's, and replays the current display list as often as the
+ * display wants, with each block's matrices blended from the previous tick
+ * to the current one by wall-clock time. That costs one tick of latency.
+ * Emulated GS draws and the 2D layer are pre-transformed and stay at the
+ * current tick. */
+#define IP_PERIOD_NS 16683350ull
+#define IP_SNAP2     0.0625f
+#define IP_BUCKETS   4096u
+
+static ps2_vk_mesh_block *ip_prev_blocks;
+static u64 *ip_prev_keys;
+static u32  ip_prev_n, ip_prev_age;
+static s32 *ip_match;
+static u8  *ip_prev_used;
+static u32 *ip_key_head, *ip_key_next, *ip_sig_head, *ip_sig_next;
+static float ip_t = 1.0f;
+static int   ip_on, ip_shown_final;
+static u64   rep_serial = 1;
+static u64   ip_period = IP_PERIOD_NS, ip_last_arrival, ip_next_ns;
+static u64   ip_A, ip_jit, ip_margin = 3000000ull, ip_S_start, ip_S_end, ip_seen_serial;
+static u64   pub_time_ns, pub_serial;
+static double ip_gpu_ms, ip_fence_ms;
+static int   ip_sample_pending;
+static u64   ip_st_ticks, ip_st_sub, ip_st_exact, ip_st_sig, ip_st_snap, ip_st_none,
+             ip_st_cuts, ip_st_late, ip_st_resync, ip_st_2d, ip_st_2d_moved;
+
+/* 2D elements (the HUD): matched by the game code that drew them and blended
+ * by vertex position, in place in the list being replayed */
+#define IP2_MAX_VERTS (1u << 18)
+typedef struct { u32 site, vfirst, vcount, off; float cx, cy; s32 match; } ip2_el;
+static ip2_el *ip2_cur, *ip2_prev;
+static float  *ip2_cur_xy, *ip2_prev_xy;
+static u32    *ip2_head, *ip2_next;
+static u8     *ip2_used;
+static u32     ip2_ncur, ip2_nprev;
+static int     ip2_on, ip_live, ip_span_open;
+static ip_span ip_span_cur;
+
+static double ip_display_hz(void);
+static double ip_target_hz(void) {
+    static int env = -1;
+    static double env_hz;
+    double hz;
+    if (env < 0) {
+        const char *e = getenv("PS2_INTERP_FPS");
+        env = e && *e;
+        env_hz = env ? atof(e) : 0.0;
+        if (env) ps2_log("vk: PS2_INTERP_FPS=%s sets the interpolated frame rate", e);
+    }
+    hz = env ? env_hz : (double)ps2_cfg.interp_fps;
+    if (hz < 0.0) hz = floor(ip_display_hz() + 0.5);      /* -1: match the display */
+    return hz > 60.5 && mesh_ok ? hz : 0.0;
+}
+
+static int ip_alloc(void) {
+    if (ip_prev_blocks) return 1;
+    ip_prev_blocks = (ps2_vk_mesh_block *)malloc((size_t)MESH_MAX_BLOCKS
+                                                 * sizeof *ip_prev_blocks);
+    ip_prev_keys = (u64 *)malloc((size_t)MESH_MAX_BLOCKS * sizeof(u64));
+    ip_match     = (s32 *)malloc((size_t)MESH_MAX_BLOCKS * sizeof(s32));
+    ip_prev_used = (u8 *)malloc(MESH_MAX_BLOCKS);
+    ip_key_next  = (u32 *)malloc((size_t)MESH_MAX_BLOCKS * sizeof(u32));
+    ip_sig_next  = (u32 *)malloc((size_t)MESH_MAX_BLOCKS * sizeof(u32));
+    ip_key_head  = (u32 *)malloc((size_t)IP_BUCKETS * sizeof(u32));
+    ip_sig_head  = (u32 *)malloc((size_t)IP_BUCKETS * sizeof(u32));
+    if (ip_prev_blocks && ip_prev_keys && ip_match && ip_prev_used && ip_key_next
+        && ip_sig_next && ip_key_head && ip_sig_head) return 1;
+    ps2_log("vk: no memory for frame interpolation; it stays off");
+    free(ip_prev_blocks);
+    ip_prev_blocks = NULL;
+    return 0;
+}
+
+/* the list that was on screen becomes the "from" side of the next blend */
+static void ip_save_prev(const mesh_arena *a) {
+    if (!ip_alloc()) return;
+    if (!a || !a->nblocks || !a->keys) {
+        if (++ip_prev_age > 3u) ip_prev_n = 0;
+        return;
+    }
+    memcpy(ip_prev_blocks, a->blocks, (size_t)a->nblocks * sizeof *ip_prev_blocks);
+    memcpy(ip_prev_keys, a->keys, (size_t)a->nblocks * sizeof(u64));
+    ip_prev_n = a->nblocks;
+    ip_prev_age = 0;
+}
+
+static u32 ip_sig(const ps2_vk_mesh_block *b) {
+    return b->prog | (b->pass << 8) | (b->mode << 16) | (b->clip << 24);
+}
+
+/* squared relative change of the transform, each output row weighed equally
+ * so the viewport's scale does not decide it */
+static float ip_dist2(const float *a, const float *b) {
+    float sum = 0.0f;
+    for (int r = 0; r < 4; r++) {
+        float d = 0.0f, na = 0.0f, nb = 0.0f, n;
+        for (int c = 0; c < 4; c++) {
+            float x = a[4 * c + r], y = b[4 * c + r], e = x - y;
+            d += e * e; na += x * x; nb += y * y;
+        }
+        n = na > nb ? na : nb;
+        if (n > 0.0f) sum += d / n;
+    }
+    return sum * 0.25f;
+}
+
+static void ip_build_matches(const mesh_arena *a) {
+    u32 n, exact = 0, sig = 0, snap = 0, none = 0;
+    ip_on = 0;
+    if (!ip_alloc() || !a || !a->keys) return;
+    n = a->nblocks;
+    if (!n || !ip_prev_n) return;
+    memset(ip_key_head, 0xFF, (size_t)IP_BUCKETS * sizeof(u32));
+    memset(ip_sig_head, 0xFF, (size_t)IP_BUCKETS * sizeof(u32));
+    memset(ip_prev_used, 0, ip_prev_n);
+    for (u32 j = ip_prev_n; j-- > 0;) {
+        u32 kb = (u32)((ip_prev_keys[j] * 0x9E3779B97F4A7C15ull) >> 52);
+        u32 sb = (ip_sig(&ip_prev_blocks[j]) * 2654435761u) >> 20;
+        ip_key_next[j] = ip_key_head[kb]; ip_key_head[kb] = j;
+        ip_sig_next[j] = ip_sig_head[sb]; ip_sig_head[sb] = j;
+    }
+    for (u32 i = 0; i < n; i++) {
+        u64 key = a->keys[i];
+        u32 kb = (u32)((key * 0x9E3779B97F4A7C15ull) >> 52);
+        float best = 1e30f;
+        s32 bj = -1;
+        for (u32 j = ip_key_head[kb]; j != 0xFFFFFFFFu; j = ip_key_next[j]) {
+            float d;
+            if (ip_prev_keys[j] != key || ip_prev_used[j]) continue;
+            d = ip_dist2(a->blocks[i].m, ip_prev_blocks[j].m);
+            if (d < best) { best = d; bj = (s32)j; }
+        }
+        if (bj >= 0 && best <= IP_SNAP2) {
+            ip_prev_used[bj] = 1;
+            ip_match[i] = bj;
+            exact++;
+        } else {
+            ip_match[i] = bj >= 0 ? -2 : -1;
+        }
+    }
+    /* meshes whose vertices change every tick (particles, trails, shadows) have
+     * no content match; they are in world space under the camera's transform,
+     * so any block of the same kind gives the camera's previous transform */
+    for (u32 i = 0; i < n; i++) {
+        u32 sb, walked = 0;
+        float best = 1e30f;
+        s32 bj = -1;
+        if (ip_match[i] != -1) { if (ip_match[i] == -2) { ip_match[i] = -1; snap++; } continue; }
+        sb = (ip_sig(&a->blocks[i]) * 2654435761u) >> 20;
+        for (u32 j = ip_sig_head[sb]; j != 0xFFFFFFFFu && walked < 256u;
+             j = ip_sig_next[j], walked++) {
+            float d;
+            if (ip_sig(&ip_prev_blocks[j]) != ip_sig(&a->blocks[i])) continue;
+            d = ip_dist2(a->blocks[i].m, ip_prev_blocks[j].m);
+            if (d < best) { best = d; bj = (s32)j; }
+        }
+        if (bj >= 0 && best <= IP_SNAP2) { ip_match[i] = -(bj + 3); sig++; }
+        else if (bj >= 0) snap++;
+        else none++;
+    }
+    /* a camera cut moves everything at once: do not sweep through it */
+    if (snap > exact + sig && snap > 8u) {
+        for (u32 i = 0; i < n; i++) ip_match[i] = -1;
+        ip_st_cuts++;
+        exact = sig = 0;
+    }
+    ip_st_exact += exact; ip_st_sig += sig; ip_st_snap += snap; ip_st_none += none;
+    ip_on = exact + sig > 0;
+}
+
+static void ip_fill(ps2_vk_mesh_block *dst, const mesh_arena *a, float t) {
+    for (u32 i = 0; i < a->nblocks; i++) {
+        const ps2_vk_mesh_block *cur = &a->blocks[i], *prev;
+        ps2_vk_mesh_block out = *cur;
+        s32 m = ip_match[i];
+        if (m != -1) {
+            int exact = m >= 0;
+            prev = &ip_prev_blocks[exact ? m : -(m + 3)];
+            for (int k = 0; k < 16; k++) {
+                out.m[k] = prev->m[k] + (cur->m[k] - prev->m[k]) * t;
+                out.c[k] = prev->c[k] + (cur->c[k] - prev->c[k]) * t;
+            }
+            if (exact) {
+                for (int k = 0; k < 12; k++) {
+                    out.l[k] = prev->l[k] + (cur->l[k] - prev->l[k]) * t;
+                    out.e[k] = prev->e[k] + (cur->e[k] - prev->e[k]) * t;
+                }
+                for (int k = 0; k < 16; k++)
+                    out.p[k] = prev->p[k] + (cur->p[k] - prev->p[k]) * t;
+                out.fog0 = prev->fog0 + (cur->fog0 - prev->fog0) * t;
+                out.fog1 = prev->fog1 + (cur->fog1 - prev->fog1) * t;
+            }
+        }
+        dst[i] = out;
+    }
+}
+
+/* Every published tick is noted, taken or not. The arrivals are jittery (the
+ * graphics thread publishes when it reaches the vertical blank in its queue),
+ * so the blend does not follow them: it follows a steady clock locked to
+ * them, and runs a margin behind it so that the next tick has nearly always
+ * arrived by the time the blend needs it. An early tick waits its turn; a
+ * late one is rare. Without this each tick boundary jumps or stalls by the
+ * arrival error, a 60 Hz judder. */
+static void ip_note_arrival(u64 a) {
+    if (ip_last_arrival && a > ip_last_arrival) {
+        u64 dt = a - ip_last_arrival, k = (dt + ip_period / 2u) / ip_period;
+        if (k >= 1u && k <= 4u) {
+            u64 per = dt / k, lo = ip_period - ip_period / 8u, hi = ip_period + ip_period / 8u;
+            if (per < lo) per = lo;
+            if (per > hi) per = hi;
+            ip_period = (ip_period * 63u + per) / 64u;
+        }
+    }
+    ip_last_arrival = a;
+    if (!ip_A) { ip_A = a; return; }
+    {
+        u64 k = a > ip_A ? (a - ip_A + ip_period / 2u) / ip_period : 0u;
+        u64 pred = ip_A + (k ? k : 1u) * ip_period;
+        s64 err = (s64)a - (s64)pred;
+        u64 mag = (u64)(err < 0 ? -err : err);
+        if (mag > ip_period / 2u || k > 4u) {
+            ip_A = a;
+            ip_jit = 0;
+            ip_st_resync++;
+        } else {
+            ip_A = (u64)((s64)pred + err / 16);
+            ip_jit -= ip_jit / 256u;
+            if (mag > ip_jit) ip_jit = mag;
+        }
+    }
+    ip_margin = ip_jit + 1000000ull;
+    if (ip_margin < 2000000ull) ip_margin = 2000000ull;
+    if (ip_margin > 12000000ull) ip_margin = 12000000ull;
+}
+
+/* may the pending tick replace the one being blended? */
+static int ip_may_take(u64 now) {
+    if (!ip_live || ip_shown_final || now >= ip_S_end) return 1;
+    if (now > pub_time_ns + ip_period) { ip_st_resync++; return 1; }
+    return 0;
+}
+
+/* the taken tick's blend starts where the last one ended and ends where the
+ * clock says the next tick is due; a small error stretches this one blend
+ * instead of jumping */
+static void ip_begin_blend(u64 now) {
+    u64 nominal = ip_A + ip_margin;
+    /* normally "now" is a fraction of a frame past nominal and the blend
+     * simply carries on from there; only a badly late take restarts it */
+    ip_S_start = now > nominal + ip_period / 2u ? now : nominal;
+    ip_S_end = nominal + ip_period;
+    if (ip_S_end < ip_S_start + ip_period / 2u) ip_S_end = ip_S_start + ip_period / 2u;
+    ip_shown_final = 0;
+    ip_st_ticks++;
+}
+
+static float ip_time_t(u64 now) {
+    if (now <= ip_S_start) return 0.0f;
+    if (now >= ip_S_end) return 1.0f;
+    return (float)((double)(now - ip_S_start) / (double)(ip_S_end - ip_S_start));
+}
+
+static double ip_display_hz(void) {
+    static u64 asked;
+    static double hz;
+    u64 now = vk_mono_ns();
+    if (!asked || now - asked > 2000000000ull) {
+        const SDL_DisplayMode *dm = window
+            ? SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(window)) : NULL;
+        hz = dm && dm->refresh_rate > 0.0f ? (double)dm->refresh_rate : 0.0;
+        asked = now;
+    }
+    return hz;
+}
+
+/* Frames are spaced evenly by a timer. If the GPU cannot hold the rate the
+ * timer never sleeps and the frames come as fast as the GPU finishes them,
+ * which keeps it at full clocks and spaces them by its own steady frame
+ * time. (Stepping the rate down to fit was tried: a GPU with slack clocks
+ * itself down, always looks busy, and the rate ratchets to the floor.) */
+static void ip_pace(double hz) {
+    u64 step = (u64)(1e9 / hz), now;
+    /* under vsync the display paces the frames better than a timer can */
+    {   double dhz = ip_display_hz();
+        if (dhz > 0.0 && hz >= dhz * 0.98
+            && (env_present_mode == (int)VK_PRESENT_MODE_FIFO_KHR
+                || env_present_mode == (int)VK_PRESENT_MODE_FIFO_RELAXED_KHR)) return;
+    }
+    now = vk_mono_ns();
+    if (now > ip_next_ns + 4u * step || ip_next_ns > now + 4u * step) ip_next_ns = now;
+    if (now < ip_next_ns) SDL_DelayPrecise(ip_next_ns - now);
+    ip_next_ns += step;
+}
+
+static int ip2_alloc(void) {
+    if (ip2_cur) return 1;
+    ip2_cur  = (ip2_el *)malloc((size_t)IP_MAX_SPANS * sizeof(ip2_el));
+    ip2_prev = (ip2_el *)malloc((size_t)IP_MAX_SPANS * sizeof(ip2_el));
+    ip2_cur_xy  = (float *)malloc((size_t)IP2_MAX_VERTS * 2u * sizeof(float));
+    ip2_prev_xy = (float *)malloc((size_t)IP2_MAX_VERTS * 2u * sizeof(float));
+    ip2_head = (u32 *)malloc((size_t)IP_BUCKETS * sizeof(u32));
+    ip2_next = (u32 *)malloc((size_t)IP_MAX_SPANS * sizeof(u32));
+    ip2_used = (u8 *)malloc(IP_MAX_SPANS);
+    if (ip2_cur && ip2_prev && ip2_cur_xy && ip2_prev_xy && ip2_head && ip2_next
+        && ip2_used) return 1;
+    free(ip2_cur);
+    ip2_cur = NULL;
+    return 0;
+}
+
+/* the tick on screen becomes the "from" side: its untouched positions are
+ * already in ip2_cur_xy, so the two sets just change places */
+static void ip2_save_prev(void) {
+    ip2_el *e = ip2_prev;
+    float *xy = ip2_prev_xy;
+    if (!ip2_cur) return;
+    ip2_prev = ip2_cur;       ip2_cur = e;
+    ip2_prev_xy = ip2_cur_xy; ip2_cur_xy = xy;
+    ip2_nprev = ip2_ncur;
+    ip2_ncur = 0;
+    ip2_on = 0;
+}
+
+static void ip2_build(const mesh_arena *a) {
+    u32 used_xy = 0, moved = 0;
+    ip2_on = 0;
+    ip2_ncur = 0;
+    if (!ip2_alloc() || !a || !a->spans) return;
+    for (u32 i = 0; i < a->nspans; i++) {
+        const ip_span *sp = &a->spans[i];
+        ip2_el *e;
+        float cx = 0.0f, cy = 0.0f;
+        if (!sp->vcount || sp->vfirst > rep_nverts || sp->vcount > rep_nverts - sp->vfirst
+            || used_xy + sp->vcount > IP2_MAX_VERTS) continue;
+        e = &ip2_cur[ip2_ncur++];
+        e->site = sp->site;
+        e->vfirst = sp->vfirst;
+        e->vcount = sp->vcount;
+        e->off = used_xy;
+        e->match = -1;
+        for (u32 k = 0; k < sp->vcount; k++) {
+            const ps2_vk_vertex *v = &rep_verts[sp->vfirst + k];
+            ip2_cur_xy[2u * (used_xy + k)] = v->x;
+            ip2_cur_xy[2u * (used_xy + k) + 1u] = v->y;
+            cx += v->x; cy += v->y;
+        }
+        e->cx = cx / (float)sp->vcount;
+        e->cy = cy / (float)sp->vcount;
+        used_xy += sp->vcount;
+    }
+    if (!ip2_ncur || !ip2_nprev) return;
+    memset(ip2_head, 0xFF, (size_t)IP_BUCKETS * sizeof(u32));
+    memset(ip2_used, 0, ip2_nprev);
+    for (u32 j = ip2_nprev; j-- > 0;) {
+        u32 b = (ip2_prev[j].site * 2654435761u) >> 20;
+        ip2_next[j] = ip2_head[b];
+        ip2_head[b] = j;
+    }
+    for (u32 i = 0; i < ip2_ncur; i++) {
+        ip2_el *e = &ip2_cur[i];
+        u32 b = (e->site * 2654435761u) >> 20;
+        float best = 64.0f * 64.0f;
+        s32 bj = -1;
+        for (u32 j = ip2_head[b]; j != 0xFFFFFFFFu; j = ip2_next[j]) {
+            const ip2_el *q = &ip2_prev[j];
+            float dx, dy, d;
+            if (q->site != e->site || q->vcount != e->vcount || ip2_used[j]) continue;
+            dx = q->cx - e->cx; dy = q->cy - e->cy;
+            d = dx * dx + dy * dy;
+            if (d < best) { best = d; bj = (s32)j; }
+        }
+        if (bj < 0) continue;
+        ip2_used[bj] = 1;
+        /* only an element that moved needs drawing in between */
+        {   const float *c = ip2_cur_xy + 2u * e->off, *q = ip2_prev_xy + 2u * ip2_prev[bj].off;
+            int mv = 0;
+            for (u32 k = 0; k < 2u * e->vcount && !mv; k++)
+                mv = fabsf(c[k] - q[k]) > 0.01f;
+            if (!mv) continue;
+        }
+        e->match = bj;
+        moved++;
+    }
+    ip_st_2d += ip2_ncur;
+    ip_st_2d_moved += moved;
+    ip2_on = moved > 0;
+}
+
+static void ip2_apply(float t);
+/* called once the frame's slot is free: the blend position is read as late
+ * as possible, after any wait for the GPU, so it matches the submit time */
+static void ip_sample(void) {
+    if (!ip_sample_pending) return;
+    ip_sample_pending = 0;
+    ip_t = ip_live ? ip_time_t(vk_mono_ns()) : 1.0f;
+    ip2_apply(ip_t);
+}
+
+static void ip2_apply(float t) {
+    if (!ip2_on) return;
+    for (u32 i = 0; i < ip2_ncur; i++) {
+        const ip2_el *e = &ip2_cur[i];
+        const float *c, *q;
+        if (e->match < 0) continue;
+        c = ip2_cur_xy + 2u * e->off;
+        q = ip2_prev_xy + 2u * ip2_prev[e->match].off;
+        for (u32 k = 0; k < e->vcount; k++) {
+            ps2_vk_vertex *v = &rep_verts[e->vfirst + k];
+            if (t >= 1.0f) { v->x = c[2u * k]; v->y = c[2u * k + 1u]; }
+            else {
+                v->x = q[2u * k] + (c[2u * k] - q[2u * k]) * t;
+                v->y = q[2u * k + 1u] + (c[2u * k + 1u] - q[2u * k + 1u]) * t;
+            }
+        }
+    }
+}
+
+/* PS2_INTERP_LOG=1: where a tick's meshes go and what is shown, because a
+ * replay only reaches the screen if the list also fills the target on show */
+static void ip_debug_list(void) {
+    static int on = -1;
+    static u32 shown;
+    u32 first_mesh = ~0u, meshes = 0, into_present = 0, mesh_rt = ~0u, rts_used = 0;
+    if (on < 0) { const char *e = getenv("PS2_INTERP_LOG"); on = e && *e && *e != '0'; }
+    if (!on) return;
+    for (u32 i = 0; i < rep_ndraws; i++) {
+        const vk_draw *d = &rep_draws[i];
+        if (d->rt < 32u) rts_used |= 1u << d->rt;
+        if (d->rt == present_rt) into_present++;
+        if (d->native == PS2_VK_NATIVE_MESH) {
+            if (first_mesh == ~0u) { first_mesh = i; mesh_rt = d->rt; }
+            meshes++;
+        }
+    }
+    if (!meshes) return;
+    if (shown++ >= 12u && (shown % 600u) != 0u) return;
+    ps2_log("interp-list: %u draws, %u meshes (first at %u, into rt%u), present rt%u "
+            "gets %u draws, rts used %08X, blocks %u, prev %u, blending %d",
+            rep_ndraws, meshes, first_mesh, mesh_rt, present_rt, into_present,
+            rts_used, rep_mesh ? rep_mesh->nblocks : 0u, ip_prev_n, ip_on);
+}
+
+static void ip_report(void) {
+    static u64 last_ticks;
+    double n;
+    if (ip_st_ticks - last_ticks < 600u) return;
+    n = (double)(ip_st_ticks - last_ticks);
+    ps2_log("interp: %.1f frames per tick (%.0f fps); per tick %.0f "
+            "blocks matched, %.0f by kind, %.0f snapped, %.0f new, %.0f of %.0f 2D elements "
+            "moving; %llu cuts", (double)ip_st_sub / n,
+            (double)ip_st_sub / n * 1e9 / (double)ip_period,
+            (double)ip_st_exact / n, (double)ip_st_sig / n, (double)ip_st_snap / n,
+            (double)ip_st_none / n, (double)ip_st_2d_moved / n, (double)ip_st_2d / n,
+            (unsigned long long)ip_st_cuts);
+    ps2_log("interp: tick %.3f ms, arrival jitter peak %.2f ms, margin %.2f ms, %llu late "
+            "ticks, %llu resyncs; GPU %.2f ms a frame, fence wait %.2f ms",
+            (double)ip_period / 1e6, (double)ip_jit / 1e6, (double)ip_margin / 1e6,
+            (unsigned long long)ip_st_late, (unsigned long long)ip_st_resync,
+            ip_gpu_ms, ip_fence_ms);
+    last_ticks = ip_st_ticks;
+    ip_st_sub = ip_st_exact = ip_st_sig = ip_st_snap = ip_st_none = ip_st_cuts = 0;
+    ip_st_late = ip_st_resync = ip_st_2d = ip_st_2d_moved = 0;
+}
+
+/* Where on the target a draw can land, in target pixels, or 0 when that is
+ * not known (geometry crossing the eye plane). A mesh is bounded by pushing
+ * the corners of its local box through its block's transform; while the scene
+ * is being interpolated the block drawn lies between the previous tick's and
+ * this tick's, so both are covered. */
+static int draw_bbox(const vk_draw *d, s32 out[4]) {
+    float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
+    if (d->native == PS2_VK_NATIVE_MESH) {
+        const mesh_arena *a = rep_mesh;
+        const ps2_vk_mesh_block *ks[2];
+        const float *b;
+        int nk = 1;
+        if (!a || !a->vbox || d->mblock >= a->nblocks || d->mvbase >= MESH_MAX_VERTS) return 0;
+        b = a->vbox + 8u * (size_t)d->mvbase;
+        if (!(b[0] <= b[3])) return 0;
+        ks[0] = &a->blocks[d->mblock];
+        if (ip_on && ip_t < 1.0f && ip_match && ip_match[d->mblock] != -1) {
+            s32 m = ip_match[d->mblock];
+            ks[nk++] = &ip_prev_blocks[m >= 0 ? m : -(m + 3)];
+        }
+        for (int q = 0; q < nk; q++) {
+            const ps2_vk_mesh_block *k = ks[q];
+            if (k->prog == 5u) {                     /* already in screen space */
+                if (b[0] < x0) x0 = b[0];
+                if (b[1] < y0) y0 = b[1];
+                if (b[3] > x1) x1 = b[3];
+                if (b[4] > y1) y1 = b[4];
+                continue;
+            }
+            for (int c = 0; c < 8; c++) {
+                float px = b[(c & 1) ? 3 : 0], py = b[(c & 2) ? 4 : 1], pz = b[(c & 4) ? 5 : 2];
+                float sx = k->m[0] * px + k->m[4] * py + k->m[8] * pz + k->m[12];
+                float sy = k->m[1] * px + k->m[5] * py + k->m[9] * pz + k->m[13];
+                float sw = k->m[3] * px + k->m[7] * py + k->m[11] * pz + k->m[15];
+                float pad = 0.0f, fx, fy;
+                if (!(sw > 1e-3f)) return 0;
+                if (k->prog == 3u) {                 /* sprites grow from their centres */
+                    float sc = fabsf(k->p[0]) > fabsf(k->p[1]) ? fabsf(k->p[0]) : fabsf(k->p[1]);
+                    pad = b[6] * sc * b[7] / sw;
+                }
+                fx = sx / sw + 0.5f - k->xoff;
+                fy = sy / sw + 0.5f - k->yoff;
+                if (!(fx == fx) || !(fy == fy) || !(pad == pad)) return 0;
+                if (fx - pad < x0) x0 = fx - pad;
+                if (fy - pad < y0) y0 = fy - pad;
+                if (fx + pad > x1) x1 = fx + pad;
+                if (fy + pad > y1) y1 = fy + pad;
+            }
+        }
+    } else {
+        if (!d->count || d->first > rep_nverts || d->count > rep_nverts - d->first) return 0;
+        for (u32 i = 0; i < d->count; i++) {
+            const ps2_vk_vertex *v = &rep_verts[d->first + i];
+            if (v->x < x0) x0 = v->x;
+            if (v->y < y0) y0 = v->y;
+            if (v->x > x1) x1 = v->x;
+            if (v->y > y1) y1 = v->y;
+        }
+    }
+    if (!(x0 <= x1) || !(y0 <= y1)) return 0;
+    /* two pixels of slack for wide lines, points and rounding */
+    x0 -= 2.0f; y0 -= 2.0f; x1 += 3.0f; y1 += 3.0f;
+    if (x0 < (float)d->scissor[0]) x0 = (float)d->scissor[0];
+    if (y0 < (float)d->scissor[2]) y0 = (float)d->scissor[2];
+    if (x1 > (float)d->scissor[1] + 1.0f) x1 = (float)d->scissor[1] + 1.0f;
+    if (y1 > (float)d->scissor[3] + 1.0f) y1 = (float)d->scissor[3] + 1.0f;
+    if (x0 < 0.0f) x0 = 0.0f;
+    if (y0 < 0.0f) y0 = 0.0f;
+    if (x1 > (float)rt_w) x1 = (float)rt_w;
+    if (y1 > (float)rt_h) y1 = (float)rt_h;
+    out[0] = (s32)floorf(x0); out[1] = (s32)floorf(y0);
+    out[2] = (s32)ceilf(x1);  out[3] = (s32)ceilf(y1);
+    return 1;
+}
+
+static vk_frame *gp_frame;
+static int gp_cur = -1;
+
+static void gp_mark(VkCommandBuffer cmd, int cat) {
+    vk_frame *fr = gp_frame;
+    if (!fr || !fr->phase_queries || cat == gp_cur || fr->phase_n >= GP_MAX) return;
+    gp_cur = cat;
+    fr->phase_cat[fr->phase_n] = (u8)cat;
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, fr->phase_queries,
+                        fr->phase_n++);
+}
+
+static void gp_collect(vk_frame *fr) {
+    static const char *const names[GP_CATS] = { "mesh", "gs-emulated", "2d", "native-pass",
+        "snapshot", "colclip", "target-switch", "overlay", "present", "end" };
+    static double acc[GP_CATS];
+    static u64 frames_n, marks, start, snaps0;
+    static u64 ts[GP_MAX];
+    u64 mask = gpu_timestamp_bits >= 64 ? ~(u64)0 : ((u64)1 << gpu_timestamp_bits) - 1, now;
+    if (!fr->phase_queries || fr->phase_n < 2u) return;
+    if (vkGetQueryPoolResults(dev, fr->phase_queries, 0, fr->phase_n, sizeof(u64) * fr->phase_n,
+                              ts, sizeof(u64), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) return;
+    for (u32 i = 0; i + 1u < fr->phase_n; i++)
+        acc[fr->phase_cat[i]] += (double)((ts[i + 1u] - ts[i]) & mask) * gpu_timestamp_period / 1e6;
+    frames_n++;
+    marks += fr->phase_n;
+    fr->phase_n = 0;
+    now = vk_mono_ns();
+    if (!start) { start = now; snaps0 = gp_snapshots; }
+    if (now - start < 5000000000ull) return;
+    {   char line[512];
+        int at = 0;
+        double total = 0.0;
+        for (int c = 0; c < GP_CATS; c++) total += acc[c];
+        at += snprintf(line + at, sizeof line - (size_t)at, "gpu-phase: %.2f ms/frame over %llu frames:",
+                       total / (double)frames_n, (unsigned long long)frames_n);
+        for (int c = 0; c < GP_CATS - 1; c++)
+            if (acc[c] > 0.0)
+                at += snprintf(line + at, sizeof line - (size_t)at, " %s %.2f (%.0f%%)", names[c],
+                               acc[c] / (double)frames_n, 100.0 * acc[c] / total);
+        snprintf(line + at, sizeof line - (size_t)at, "; %.1f snapshots and %.0f marks a frame",
+                 (double)(gp_snapshots - snaps0) / (double)frames_n, (double)marks / (double)frames_n);
+        ps2_log("%s", line);
+        {   static u64 by0[2][2], skip0;
+            static double area0;
+            double n = (double)frames_n, ns = (double)(gp_snapshots - snaps0);
+            ps2_log("gpu-phase: snapshots a frame -- self-read: %.1f by emulated draws, %.1f by meshes; "
+                    "DATE: %.1f by emulated draws, %.1f by meshes; each copies %.0f%% of the target "
+                    "on average (%.1f full targets a frame); %.1f a frame needed no copy at all",
+                    (double)(gp_snap_by[0][0] - by0[0][0]) / n, (double)(gp_snap_by[0][1] - by0[0][1]) / n,
+                    (double)(gp_snap_by[1][0] - by0[1][0]) / n, (double)(gp_snap_by[1][1] - by0[1][1]) / n,
+                    ns > 0.0 ? 100.0 * (gp_snap_area - area0) / ns : 0.0, (gp_snap_area - area0) / n,
+                    (double)(gp_snap_skipped - skip0) / n);
+            skip0 = gp_snap_skipped;
+            memcpy(by0, gp_snap_by, sizeof by0);
+            area0 = gp_snap_area;
+        }
+    }
+    for (int c = 0; c < GP_CATS; c++) acc[c] = 0.0;
+    frames_n = marks = 0;
+    start = now;
+    snaps0 = gp_snapshots;
+}
+
 static void render_list(VkCommandBuffer cmd, vk_frame *fr) {
     VkViewport vp;
     u32 i;
@@ -3410,15 +4168,27 @@ static void render_list(VkCommandBuffer cmd, vk_frame *fr) {
     if (line_w > max_line_width) line_w = max_line_width;
     if (point_sz > max_point_size) point_sz = max_point_size;
 
-    if (rep_nverts) {
+    /* a tick is replayed several times when the scene is interpolated, and
+     * only the mesh blocks differ between those replays: a slot that already
+     * holds this tick's vertices keeps them */
+    u64 stamp = (rep_serial << 8) | (u64)(rt_scale & 0xFFu);
+    int fresh = fr->list_stamp != stamp;
+    fr->list_stamp = stamp;
+
+    if (rep_nverts && (fresh || ip2_on)) {
         memcpy(fr->vptr, rep_verts, vbytes);
         if (rt_scale > 1u) snap_sprite_rows((ps2_vk_vertex *)fr->vptr);
     }
     if (mesh_ok && rep_mesh && rep_mesh->nblocks) {
-        memcpy(fr->mvptr, rep_mesh->recs, (size_t)rep_mesh->nrecs * MESH_REC_BYTES);
-        memcpy(fr->miptr, rep_mesh->idx, (size_t)rep_mesh->nidx * sizeof(u32));
-        memcpy(fr->mcptr, rep_mesh->blocks,
-               (size_t)rep_mesh->nblocks * sizeof(ps2_vk_mesh_block));
+        if (fresh) {
+            memcpy(fr->mvptr, rep_mesh->recs, (size_t)rep_mesh->nrecs * MESH_REC_BYTES);
+            memcpy(fr->miptr, rep_mesh->idx, (size_t)rep_mesh->nidx * sizeof(u32));
+        }
+        if (ip_on && ip_t < 1.0f)
+            ip_fill((ps2_vk_mesh_block *)fr->mcptr, rep_mesh, ip_t);
+        else
+            memcpy(fr->mcptr, rep_mesh->blocks,
+                   (size_t)rep_mesh->nblocks * sizeof(ps2_vk_mesh_block));
     }
     fr->soff = 0;
 
@@ -3543,7 +4313,31 @@ static void render_list(VkCommandBuffer cmd, vk_frame *fr) {
                     || rep_draws[i - 1].wrap != d->wrap))
                     rts[d->rt].snap_valid = 0;
                 int fresh = !rts[d->rt].snap_valid;
-                rset = target_snapshot(cmd, &rts[d->rt]);
+                gp_snap_why = 0; gp_snap_mesh = d->native == PS2_VK_NATIVE_MESH;
+                {   /* PS2_SELFREAD_LOG=1: what the self-reading draws are */
+                    static int on = -1;
+                    static u64 last;
+                    if (on < 0) on = env_flag("PS2_SELFREAD_LOG") > 0;
+                    if (on && (stat_frames - last > 600u || stat_frames == last)) {
+                        s32 bb[4] = {0, 0, 0, 0};
+                        int known = draw_bbox(d, bb);
+                        const ps2_vk_mesh_block *k = d->native == PS2_VK_NATIVE_MESH && rep_mesh
+                            && d->mblock < rep_mesh->nblocks ? &rep_mesh->blocks[d->mblock] : NULL;
+                        if (stat_frames != last) ps2_log("selfread: ---- frame %llu ----",
+                                                         (unsigned long long)stat_frames);
+                        last = stat_frames;
+                        ps2_log("selfread: draw %u/%u rt%u emitter %u prog %u pass %u mode %u idx %u "
+                                "blend %03X tex %.0fx%.0f wrap %X bbox %s %d,%d-%d,%d scissor %d,%d-%d,%d "
+                                "dirty %d,%d-%d,%d valid %d",
+                                i, rep_ndraws, d->rt, d->emitter, k ? k->prog : 99u, k ? k->pass : 0u,
+                                k ? k->mode : 0u, d->count, d->blend, d->tex_w, d->tex_h, d->wrap,
+                                known ? "ok" : "unknown", bb[0], bb[1], bb[2], bb[3],
+                                d->scissor[0], d->scissor[2], d->scissor[1], d->scissor[3],
+                                rts[d->rt].sdx0, rts[d->rt].sdy0, rts[d->rt].sdx1, rts[d->rt].sdy1,
+                                rts[d->rt].snap_valid);
+                    }
+                }
+                rset = target_snapshot(cmd, &rts[d->rt], NULL);
                 if (rset) stat_selfreads++;
                 if (fresh && rset) {
                     cur_fb_w = 0;
@@ -3613,10 +4407,59 @@ static void render_list(VkCommandBuffer cmd, vk_frame *fr) {
         }
         {   VkDescriptorSet dset = set;
             if (d->date && d->rt < RT_SLOTS && rts[d->rt].created) {
-                VkDescriptorSet snap = target_snapshot(cmd, &rts[d->rt]);
+                gp_snap_why = 1; gp_snap_mesh = d->native == PS2_VK_NATIVE_MESH;
+                s32 box[4];
+                {   /* PS2_SELFREAD_LOG=1: what the destination-alpha draws are */
+                    static int on = -1;
+                    static u64 last;
+                    if (on < 0) on = env_flag("PS2_SELFREAD_LOG") > 0;
+                    if (on && (stat_frames - last > 600u || stat_frames == last)) {
+                        s32 bb[4] = {0, 0, 0, 0};
+                        int known = draw_bbox(d, bb);
+                        const ps2_vk_mesh_block *k = d->native == PS2_VK_NATIVE_MESH && rep_mesh
+                            && d->mblock < rep_mesh->nblocks ? &rep_mesh->blocks[d->mblock] : NULL;
+                        if (stat_frames != last) ps2_log("date: ---- frame %llu ----",
+                                                         (unsigned long long)stat_frames);
+                        last = stat_frames;
+                        ps2_log("date: draw %u/%u rt%u emitter %u prog %u pass %u idx %u blend %03X "
+                                "depth %03X flags %08X bbox %s %d,%d-%d,%d (%.0f%% of target)",
+                                i, rep_ndraws, d->rt, d->emitter, k ? k->prog : 99u, k ? k->pass : 0u,
+                                d->count, d->blend, d->depth, d->frag_flags,
+                                known ? "ok" : "UNKNOWN", bb[0], bb[1], bb[2], bb[3],
+                                known ? 100.0 * (double)(bb[2] - bb[0]) * (double)(bb[3] - bb[1])
+                                        / ((double)rt_w * (double)rt_h) : 100.0);
+                    }
+                }
+                static int bounded = -1;
+                if (bounded < 0) {
+                    /* PS2_SNAP_BOUNDS=0 goes back to refreshing the whole stale
+                     * area of the snapshot before every destination alpha test */
+                    const char *e = getenv("PS2_SNAP_BOUNDS");
+                    bounded = !(e && *e == '0');
+                    if (!bounded) ps2_log("vk: PS2_SNAP_BOUNDS=0 -- destination alpha tests "
+                                          "copy the whole stale area");
+                }
+                if (!draw_bbox(d, box)) {
+                    box[0] = 0; box[1] = 0; box[2] = (s32)rt_w; box[3] = (s32)rt_h;
+                }
+                VkDescriptorSet snap = target_snapshot(cmd, &rts[d->rt], bounded ? box : NULL);
                 if (snap) dset = snap;
                 cur_fb_w = 0;
                 vb = 0;
+            }
+            /* does this draw change the target's alpha? (bit 4: alpha is
+             * written; bit 8: the alpha channel is masked off or absent) */
+            if (d->rt < RT_SLOTS && ((d->depth >> 4) & 1u) && !((d->depth >> 8) & 1u)) {
+                vk_target *w = &rts[d->rt];
+                s32 wb[4];
+                if (!draw_bbox(d, wb)) {
+                    wb[0] = d->scissor[0]; wb[1] = d->scissor[2];
+                    wb[2] = d->scissor[1] + 1; wb[3] = d->scissor[3] + 1;
+                }
+                if (wb[0] < w->adx0) w->adx0 = wb[0];
+                if (wb[1] < w->ady0) w->ady0 = wb[1];
+                if (wb[2] > w->adx1) w->adx1 = wb[2];
+                if (wb[3] > w->ady1) w->ady1 = wb[3];
             }
             {   VkDescriptorSet sets[2];
                 sets[0] = set; sets[1] = dset;
@@ -3705,6 +4548,7 @@ static void render_list(VkCommandBuffer cmd, vk_frame *fr) {
                 vkCmdBindIndexBuffer(cmd, fr->mibuf, 0, VK_INDEX_TYPE_UINT32);
                 ib_ok = 1;
             }
+            gp_mark(cmd, GP_MESH);
             vkCmdDrawIndexed(cmd, d->count, 1, d->first, (int32_t)d->mvbase, 0);
             stat_mesh_draws++;
         } else {
@@ -3713,6 +4557,7 @@ static void render_list(VkCommandBuffer cmd, vk_frame *fr) {
                 if (rep_nverts) vkCmdBindVertexBuffers(cmd, 0, 1, &fr->vbuf, &zero);
                 vb = 1;
             }
+            gp_mark(cmd, d->native == PS2_VK_NATIVE_2D ? GP_2D : GP_GS);
             vkCmdDraw(cmd, d->count, 1, d->first, 0);
         }
         stat_draws++;
@@ -3955,6 +4800,8 @@ static void gpu_speed_collect(vk_frame *fr) {
     }
     u64 mask = gpu_timestamp_bits >= 64 ? ~(u64)0 : ((u64)1 << gpu_timestamp_bits) - 1;
     double ms = ((stamps[2] - stamps[0]) & mask) * gpu_timestamp_period / 1e6;
+    ip_gpu_ms = ip_gpu_ms > 0.0 ? ip_gpu_ms + (ms - ip_gpu_ms) * 0.05 : ms;
+    if (!renderer_speed_enabled()) return;
     total += ms;
     if (ms > peak) peak = ms;
     scene += ((stamps[1] - stamps[0]) & mask) * gpu_timestamp_period / 1e6;
@@ -3976,6 +4823,7 @@ static void draw_and_present(void) {
     u32 image_index = 0;
     int show = !field_skip_present;
     VkResult r;
+    if (vk_no_present()) show = 0;
     VkCommandBufferBeginInfo bi;
     VkSubmitInfo si;
     VkPipelineStageFlags wait_stage =
@@ -3985,9 +4833,11 @@ static void draw_and_present(void) {
     u64 times[VS_N] = {0}, begin = timing ? vk_mono_ns() : 0, mark = begin;
 
     r = vkWaitForFences(dev, 1, &fr->fence, VK_TRUE, VK_WAIT_NS);
+    ip_sample();
     if (timing) { u64 now=vk_mono_ns(); times[VS_FENCE]=now-mark; mark=now; }
     if (r != VK_SUCCESS) goto finished;
     gpu_speed_collect(fr);
+    gp_collect(fr);
     if (show) {
         if (swap_dirty) {
             swap_dirty = 0;
@@ -4013,6 +4863,10 @@ static void draw_and_present(void) {
     vkResetCommandBuffer(fr->cmd, 0);
     if (show && !present_blank) ov_prepare(); else ov_show = 0;
     vkBeginCommandBuffer(fr->cmd, &bi);
+    gp_frame = fr;
+    gp_cur = -1;
+    fr->phase_n = 0;
+    if (fr->phase_queries) vkCmdResetQueryPool(fr->cmd, fr->phase_queries, 0, GP_MAX);
     if (fr->timing_queries) {
         vkCmdResetQueryPool(fr->cmd, fr->timing_queries, 0, 3);
         vkCmdWriteTimestamp(fr->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, fr->timing_queries, 0);
@@ -4020,8 +4874,9 @@ static void draw_and_present(void) {
     render_list(fr->cmd, fr);
     if (fr->timing_queries)
         vkCmdWriteTimestamp(fr->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, fr->timing_queries, 1);
-    if (show && ov_show) ov_compose(fr->cmd, fr);
-    if (show) present_frame(fr->cmd, image_index);
+    if (show && ov_show) { gp_mark(fr->cmd, GP_OVERLAY); ov_compose(fr->cmd, fr); }
+    if (show) { gp_mark(fr->cmd, GP_PRESENT); present_frame(fr->cmd, image_index); }
+    gp_mark(fr->cmd, GP_END);
     if (fr->timing_queries)
         vkCmdWriteTimestamp(fr->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, fr->timing_queries, 2);
     vkEndCommandBuffer(fr->cmd);
@@ -4576,7 +5431,8 @@ static void *renderer_main(void *arg) {
         ui.color_format = swap_format;
         ui.image_count = swap_count;
         ui.max_anisotropy = max_aniso;
-        if (ps2_ui_init(&ui) != 0) ps2_log("ui: settings menu unavailable");
+        if (vk_no_present()) ps2_log("ui: no swapchain (PS2_NO_PRESENT), so no settings menu");
+        else if (ps2_ui_init(&ui) != 0) ps2_log("ui: settings menu unavailable");
     }
     if (ps2_cfg.window_mode != PS2_WIN_WINDOWED) apply_window_settings();
     {
@@ -4598,31 +5454,90 @@ static void *renderer_main(void *arg) {
 
     for (;;) {
         struct timespec ts;
+        double ihz;
+        int took = 0, can_take;
         pump_events();
         if (pipe_warm_n) pipe_warm_step(4000000ull);
         else if (npipes > pipe_saved_n && vk_mono_ns() - pipe_saved_ns > 20000000000ull)
             pipe_cache_save(0);
+        ihz = ip_target_hz();
+        /* wait for this frame's slot before looking for a new tick, so the
+         * decision is made with the state at the moment the frame is drawn */
+        if (ihz > 0.0 && ip_live && !ip_shown_final) {
+            ip_pace(ihz);
+            /* when the GPU is the limit the wait for a free frame slot is
+             * long; take it here, before choosing the tick and the blend
+             * position, not between choosing them and drawing */
+            pthread_mutex_lock(&gpu_lock);
+            if (dev) {
+                u64 f0 = vk_mono_ns();
+                vkWaitForFences(dev, 1, &frames[frame_index].fence, VK_TRUE, VK_WAIT_NS);
+                ip_fence_ms += ((double)(vk_mono_ns() - f0) / 1e6 - ip_fence_ms) * 0.125;
+            }
+            pthread_mutex_unlock(&gpu_lock);
+        }
         pthread_mutex_lock(&list_lock);
         if (renderer_running <= 0) { pthread_mutex_unlock(&list_lock); break; }
-        if (!frame_requested) {
+        if (ihz > 0.0 && pub_serial != ip_seen_serial) {
+            ip_seen_serial = pub_serial;
+            ip_note_arrival(pub_time_ns);
+        }
+        /* a tick that arrives while the last one is still being blended waits
+         * for the blend to finish; until then there are frames to draw */
+        can_take = frame_requested && (ihz <= 0.0 || ip_may_take(vk_mono_ns()));
+        if (!can_take && !(ihz > 0.0 && ip_live && !ip_shown_final)) {
             clock_gettime(CLOCK_REALTIME, &ts);
             ts.tv_nsec += 4 * 1000 * 1000;
             if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
             pthread_cond_timedwait(&list_cv, &list_lock, &ts);
-            if (!frame_requested) { pthread_mutex_unlock(&list_lock); continue; }
+            pthread_mutex_unlock(&list_lock);
+            continue;
         }
-        rep_verts  = pub_verts;
-        rep_draws  = pub_draws;
-        rep_nverts = pub_nverts;
-        rep_ndraws = pub_ndraws;
-        rep_mesh   = pub_mesh;
-        frame_requested = 0;
-        pthread_cond_broadcast(&list_cv);
+        if (can_take) {
+            if (ihz > 0.0) { ip_save_prev(rep_mesh); ip2_save_prev(); }
+            rep_verts  = pub_verts;
+            rep_draws  = pub_draws;
+            rep_nverts = pub_nverts;
+            rep_ndraws = pub_ndraws;
+            rep_mesh   = pub_mesh;
+            rep_serial++;
+            frame_requested = 0;
+            took = 1;
+            pthread_cond_broadcast(&list_cv);
+        }
         pthread_mutex_unlock(&list_lock);
-        field_skip_present = !field_present_due();
-        replay_frame();
-        if (!field_skip_present) fps_cap_last = vk_mono_ns();
-        field_skip_present = 0;
+        if (ihz > 0.0) {
+            if (took) {
+                ip_build_matches(rep_mesh);
+                ip2_build(rep_mesh);
+                ip_live = ip_on || ip2_on;
+                ip_begin_blend(vk_mono_ns());
+                ip_debug_list();
+            }
+            ip_sample_pending = 1;
+            field_skip_present = 0;
+            replay_frame();
+            if (ip_sample_pending) {         /* nothing was drawn (minimised) */
+                ip_sample_pending = 0;
+                ip_t = 1.0f;
+            }
+            if (ip_t >= 1.0f) {
+                if (ip_live && !took && !ip_shown_final) ip_st_late++;
+                ip_shown_final = 1;
+            }
+            ip_st_sub++;
+            ip_report();
+        } else {
+            ip_on = ip2_on = ip_live = 0;
+            ip_t = 1.0f;
+            ip_prev_n = 0;
+            ip2_nprev = ip2_ncur = 0;
+            ip_A = 0;
+            field_skip_present = !field_present_due();
+            replay_frame();
+            if (!field_skip_present) fps_cap_last = vk_mono_ns();
+            field_skip_present = 0;
+        }
         update_title();
     }
     SDL_RemoveEventWatch(modal_redraw_watch, NULL);
@@ -4656,6 +5571,10 @@ int ps2_video_init(const char *title, int width, int height) {
             slot_mesh[s].idx = (u32 *)malloc((size_t)MESH_MAX_INDICES * sizeof(u32));
             slot_mesh[s].blocks = (ps2_vk_mesh_block *)malloc(
                 (size_t)MESH_MAX_BLOCKS * sizeof(ps2_vk_mesh_block));
+            slot_mesh[s].vhash = (u64 *)calloc(MESH_MAX_VERTS, sizeof(u64));
+            slot_mesh[s].vbox = (float *)calloc((size_t)MESH_MAX_VERTS * 8u, sizeof(float));
+            slot_mesh[s].keys = (u64 *)calloc(MESH_MAX_BLOCKS, sizeof(u64));
+            slot_mesh[s].spans = (ip_span *)calloc(IP_MAX_SPANS, sizeof(ip_span));
         }
     }
     rec_slot  = 0;
@@ -4725,6 +5644,26 @@ void ps2_vk_draw(int topology, const ps2_vk_state *st,
     ps2_vk_draw_inner(topology, st, v, n);
     PS2_PHASE_END(PS2_PH_VKDRAW);
 }
+/* the 2D layer brackets each element it hands over, so the renderer can tell
+ * which vertices are one HUD element and which game code drew it */
+void ps2_vk_ip_span_begin(u32 site, u32 flags) {
+    ip_span_open = 1;
+    ip_span_cur.site = site;
+    ip_span_cur.flags = flags;
+    ip_span_cur.vfirst = rec_nverts;
+    ip_span_cur.vcount = 0;
+}
+
+void ps2_vk_ip_span_end(void) {
+    mesh_arena *a = rec_mesh;
+    if (!ip_span_open) return;
+    ip_span_open = 0;
+    if (!a || !a->spans || a->nspans >= IP_MAX_SPANS
+        || rec_nverts <= ip_span_cur.vfirst) return;
+    ip_span_cur.vcount = rec_nverts - ip_span_cur.vfirst;
+    a->spans[a->nspans++] = ip_span_cur;
+}
+
 void ps2_vk_draw_2d(int topology, const ps2_vk_state *st,
                     const ps2_vk_vertex *v, int n) {
     if (ps2_vk_before_record) ps2_vk_before_record();
@@ -4765,6 +5704,44 @@ int ps2_vk_mesh_store(const u8 *records, u32 n_verts, const u32 *indices,
     memcpy(a->recs + (size_t)a->nrecs * MESH_REC_BYTES, records,
            (size_t)n_verts * MESH_REC_BYTES);
     memcpy(a->idx + a->nidx, indices, (size_t)n_indices * sizeof(u32));
+    if (a->vhash && n_verts) {
+        /* identity of the mesh for frame interpolation: its local-space
+         * positions, which a rigid model repeats every tick */
+        u64 h = 0x9E3779B97F4A7C15ull ^ n_verts;
+        for (u32 v = 0; v < n_verts; v++) {
+            const u8 *p = records + (size_t)v * MESH_REC_BYTES;
+            u64 xy; u32 z;
+            memcpy(&xy, p, 8);
+            memcpy(&z, p + 8, 4);
+            h = (h ^ xy) * 0xD6E8FEB86659FD93ull;
+            h = (h ^ z ^ (h >> 32)) * 0xD6E8FEB86659FD93ull;
+        }
+        a->vhash[a->nrecs] = h;
+    }
+    if (a->vbox && n_verts) {
+        float *b = a->vbox + 8u * (size_t)a->nrecs;
+        b[0] = b[1] = b[2] = 1e30f;
+        b[3] = b[4] = b[5] = -1e30f;
+        b[6] = b[7] = 0.0f;
+        for (u32 v = 0; v < n_verts; v++) {
+            const u8 *p = records + (size_t)v * MESH_REC_BYTES;
+            float pos[3], uvz;
+            s32 nrm[2];
+            memcpy(pos, p, 12);
+            memcpy(nrm, p + 16, 8);
+            memcpy(&uvz, p + 48 + 8, 4);
+            for (int k = 0; k < 3; k++) {
+                if (pos[k] < b[k]) b[k] = pos[k];
+                if (pos[k] > b[3 + k]) b[3 + k] = pos[k];
+            }
+            for (int k = 0; k < 2; k++) {
+                float n = (float)(nrm[k] < 0 ? -nrm[k] : nrm[k]);
+                if (n > b[6]) b[6] = n;
+            }
+            uvz = uvz < 0.0f ? -uvz : uvz;
+            if (uvz > b[7]) b[7] = uvz;
+        }
+    }
     *vbase = a->nrecs;
     *ifirst = a->nidx;
     a->nrecs += n_verts;
@@ -4792,6 +5769,12 @@ void ps2_vk_draw_mesh_topo(const ps2_vk_state *st, const ps2_vk_mesh_block *b,
     if (ps2_vk_before_record) ps2_vk_before_record();
     if (a->nblocks >= MESH_MAX_BLOCKS) { stat_mesh_overflow++; return; }
     a->blocks[a->nblocks] = *b;
+    if (a->keys) {
+        u64 k = a->vhash && vbase < MESH_MAX_VERTS ? a->vhash[vbase] : 0;
+        k ^= ((u64)n_indices << 40) ^ ((u64)b->prog << 24) ^ ((u64)b->pass << 16)
+           ^ ((u64)b->mode << 8) ^ (u64)topology;
+        a->keys[a->nblocks] = k;
+    }
     rec_mesh_pending.vbase = vbase;
     rec_mesh_pending.ifirst = ifirst;
     rec_mesh_pending.icount = n_indices;
@@ -5300,6 +6283,8 @@ int ps2_vk_present(u32 disp_x, u32 disp_y, u32 disp_w, u32 disp_h, u32 rt) {
     rec_ndraws = 0;
     rec_mesh   = &slot_mesh[rec_slot];
     rec_mesh->nrecs = rec_mesh->nidx = rec_mesh->nblocks = 0;
+    rec_mesh->nspans = 0;
+    ip_span_open = 0;
     if (disp_w) present_w = disp_w;
     if (disp_h) present_h = disp_h;
     present_x = disp_x;
@@ -5309,6 +6294,8 @@ int ps2_vk_present(u32 disp_x, u32 disp_y, u32 disp_w, u32 disp_h, u32 rt) {
     if (env_show_rt == -1) env_show_rt = env_flag("PS2_SHOW_RT");
     if (env_show_rt >= 0) { present_rt = (u32)env_show_rt % RT_SLOTS; present_blank = 0; }
     if (!replace) tex_rec_seq++;
+    pub_time_ns = vk_mono_ns();
+    pub_serial++;
     frame_requested = 1;
     frame_done = 0;
     pthread_cond_broadcast(&list_cv);
